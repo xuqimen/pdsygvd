@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 	
-	srand(1+rank);
+	srand(1+rank+(int)time(NULL));
 	for (j = 0; j < N_loc; j++) {
 		for (i = 0; i < M_loc; i++) {
 			A[j*M_loc+i] = 0.0 + (1.0 - 0.0) * (double) rand() / RAND_MAX;
@@ -218,7 +218,11 @@ int main(int argc, char **argv) {
 	double *C2 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
 	double *D2 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
 	double *E2 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
-	
+	// make another copy
+	double *C3 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
+	double *D3 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
+	double *E3 = (double *)mkl_malloc( sizeof(double) * max(M_loc_C * N_loc_C,1), 64);
+
 	/***************************************************
 	 *          Perform matrix multiplication          *
 	 ***************************************************/ 
@@ -239,10 +243,10 @@ int main(int argc, char **argv) {
 
 	// create a copy of C and D
 	for (int i = 0; i < M_loc_C * N_loc_C; i++) {
-		C2[i] = C[i];
+		C3[i] = C2[i] = C[i];
 	}
 	for (int i = 0; i < M_loc_C * N_loc_C; i++) {
-		D2[i] = D[i];
+		D3[i] = D2[i] = D[i];
 	}
 
 	// ** Print out result matrix ** //
@@ -277,10 +281,12 @@ int main(int argc, char **argv) {
 	// ** Start solving generalized eigenvalue problem ** //
 	int il = 1, iu = 1, lwork, *iwork, liwork, *ifail, *icluster;
 	double *work, *gap, vl = 0.0, vu = 0.0, abstol, orfac = 0.001; 
-	
-	t1 = MPI_Wtime();
+    orfac = 0.0; // do not reorthogonalize eigenvectors
+	// orfac = 1e-6; // reorthogonalize the corresponding eigvecs if two eigvals differ by < orfac
+    t1 = MPI_Wtime();
 	// this setting yields the most orthogonal eigenvectors
 	abstol = pdlamch_(&ictxt_1, "U");
+	//abstol = 2*pdlamch_(&ictxt_1, "S");
 	t2 = MPI_Wtime();
 	if(!rank) printf("rank = %d, abstol = %.3e, calculating abstol (for most orthogonal eigenvectors) took %.3f ms\n",rank, abstol, (t2-t1)*1e3);
 	
@@ -310,11 +316,11 @@ int main(int argc, char **argv) {
 	
 	
 	lwork = (int) fabs(work[0]);
-	lwork += max(N*N,2000000);
+	// lwork += max(N*N,2000000);
 	work = realloc(work, lwork * sizeof(double));
 	
 	liwork = iwork[0];
-	liwork += max(N*N,2000000);
+	// liwork += max(N*N,2000000);
 	iwork = realloc(iwork, liwork * sizeof(int));
 	
 	NZ = N;
@@ -338,20 +344,80 @@ int main(int argc, char **argv) {
 	// }
 	
 
+	// ** test pdsygvd ** //
 	double *lambda2 = (double *)malloc(N * sizeof(double));
-
 	t1 = MPI_Wtime();
 	automem_pdsygvd_( 
 		&ONE, "V", "U", &N, C2, &ONE, &ONE, descC, D2, &ONE, &ONE, descC, 
 		lambda2, E2, &ONE, &ONE, descC, &info);
+	assert(info == 0);
+	MPI_Bcast(lambda2, N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 	t2 = MPI_Wtime();
-	if (!rank) printf("rank = %d, info = %d, time for D&C eigensolver: %.3f ms\n", 
+	if (!rank) printf("rank = %d, info = %d, time for pdsygvd (D&C eigensolver): %.3f ms\n", 
 			rank, info, (t2 - t1)*1e3);
-	
 
+	// check results
+	double eigvaldiff_gvd = 0.0;
+	for (int i = 0; i < N; i++) {
+		eigvaldiff_gvd = max(fabs(lambda[i] - lambda2[i]), eigvaldiff_gvd);
+	}
+	MPI_Allreduce(MPI_IN_PLACE, &eigvaldiff_gvd, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+	if (rank == 0) {
+		printf("err in eigvals (pdsygvd, D&C): %.3e\n", eigvaldiff_gvd);
+	}
+	// check eigenvectors
+	double eigvecdiff_gvd_local = 0.0;
+	for (int i = 0; i < M_loc_C * N_loc_C; i++) {
+		eigvecdiff_gvd_local = max(fabs(fabs(E[i]) - fabs(E2[i])), eigvecdiff_gvd_local);
+	}
+	double eigvecdiff_gvd = 0.0;
+	MPI_Allreduce(&eigvecdiff_gvd_local, &eigvecdiff_gvd, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+	if (rank == 0) {
+		printf("err in eigvecs (pdsygvd, D&C): %.3e\n", eigvecdiff_gvd);
+	}
+
+
+#define TEST_PDSYGV
+#ifdef TEST_PDSYGV
+	// ** test pdsygv ** //
+	double *lambda3 = (double *)malloc(N * sizeof(double));
+	t1 = MPI_Wtime();
+	automem_pdsygv_( 
+		&ONE, "V", "U", &N, C3, &ONE, &ONE, descC, D3, &ONE, &ONE, descC, 
+		lambda3, E3, &ONE, &ONE, descC, &info);
+	assert(info == 0);
+	t2 = MPI_Wtime();
+	if (!rank) printf("rank = %d, info = %d, time for pdsygv (non-expert QR eigensolver): %.3f ms\n", 
+			rank, info, (t2 - t1)*1e3);
+
+	double eigvaldiff_gv = 0.0;
+	for (int i = 0; i < N; i++) {
+		eigvaldiff_gv = max(fabs(lambda[i] - lambda3[i]), eigvaldiff_gv);
+	}
+	MPI_Allreduce(MPI_IN_PLACE, &eigvaldiff_gv, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+	if (rank == 0) {
+		printf("err in eigvals (pdsygv, non-expert QR): %.3e\n", eigvaldiff_gv);
+	}
+	// check eigenvectors
+	double eigvecdiff_gv_local = 0.0;
+	for (int i = 0; i < M_loc_C * N_loc_C; i++) {
+		eigvecdiff_gv_local = max(fabs(fabs(E[i]) - fabs(E3[i])), eigvecdiff_gv_local);
+	}
+	double eigvecdiff_gv = 0.0;
+	MPI_Allreduce(&eigvecdiff_gv_local, &eigvecdiff_gv, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+	if (rank == 0) {
+		printf("err in eigvecs (pdsygv, non-expert QR): %.3e\n", eigvecdiff_gv);
+	}
+	free(lambda3);
+#endif // #ifdef TEST_PDSYGV
+
+
+
+	// ** print out eigenvalues ** //
 	// for (int i = 0; i < N; i++) {
-	// 	if ((!rank) && (fabs(lambda[i] - lambda2[i]) > fabs(lambda[i])*1e-5))
-	// 		printf("lambda[%d] = %.16f, lambda2[%d] = %.16f, diff = %.6e\n",
+	// 	//if ((!rank) && (fabs(lambda[i] - lambda2[i]) > fabs(lambda[i])*1e-5))
+	// 		printf("lambda[%d] = %20.16f, lambda2[%d] = %20.16f, diff = %10.3e\n",
 	// 				i, lambda[i], i, lambda2[i], lambda[i]-lambda2[i]);
 	// }
 
@@ -362,17 +428,6 @@ int main(int argc, char **argv) {
 	// 	}
 	// }
   
-	double eigvaldiff = 0;
-	for (int i = 0; i < N; i++) {
-		eigvaldiff = max(fabs(lambda[i] - lambda2[i]), eigvaldiff);
-	}
-
-	if (rank == 0) 
-		printf("err in eigvals: %.3e\n", eigvaldiff);
-
-	// check eigenvectors
-	// pdlange(char *norm , MKL_INT *m , MKL_INT *n , double *a , MKL_INT *ia , 
-	// 	MKL_INT *ja , MKL_INT *desca , double *work );
 
 
 	// ** Print out result matrix ** //
@@ -400,6 +455,7 @@ int main(int argc, char **argv) {
 	// }
 
 	free(lambda);
+	free(lambda2);
 	free(work);
 	free(gap);
 	free(iwork);
@@ -414,6 +470,9 @@ int main(int argc, char **argv) {
 	mkl_free(C2);
 	mkl_free(D2);
 	mkl_free(E2);
+	mkl_free(C3);
+	mkl_free(D3);
+	mkl_free(E3);
 
 	Cblacs_gridexit( ictxt_1 ); // release grid/context with handle ictxt_1
 	Cblacs_gridexit( ictxt_0 ); // release grid/context with handle ictxt_0

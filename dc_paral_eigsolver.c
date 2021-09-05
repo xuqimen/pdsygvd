@@ -49,11 +49,6 @@ extern void   Cfree_blacs_system_handle(int handle);
 #define min(x,y) (((x) > (y)) ? (y) : (x))
 
 
-// my own divide & conquer parallel eigensolver
-void automem_pdsygvd_( 
-	int *ibtype, char *jobz, char *uplo, int *n, double *a, int *ia,
-	int *ja, int *desca, double *b, int *ib, int *jb, int *descb, 
-	double *w, double *z, int *iz, int *jz, int *descz, int *info);
 
 /**
  * @brief Call the pdsyevd_ routine with an automatic workspace setup.
@@ -90,7 +85,7 @@ void automem_pdsyevd_ (
 
 	lwork = max(lwork, 5 * N + max(5 * NN, NP0 * MQ0 + 2 * NB * NB) 
 				+ ((N - 1) / (nprow * npcol) + 1) * NN);
-	lwork += max(N*N, min(10*lwork,2000000)); // for safety
+	// lwork += max(N*N, min(10*lwork,2000000)); // for safety
 	work = realloc(work, lwork * sizeof(double));
 
 	liwork = iwork[0];
@@ -101,6 +96,34 @@ void automem_pdsyevd_ (
 	// call the routine again to perform the calculation
 	pdsyevd_(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, descz, 
 		work, &lwork, iwork, &liwork, info);
+	//! eigenvalues w are not correct on all processes except for the root
+	// extern MPI_Comm Cblacs2sys_handle(int BlacsCtxt);
+	// printf("ictxt = %d\n", ictxt);
+	// MPI_Comm comm = Cblacs2sys_handle(ictxt);
+	// printf("comm = %ld, MPI_COMM_WORLD = %ld\n",(long)comm,(long)MPI_COMM_WORLD);
+	// int rank_t;
+	// MPI_Comm_rank(comm, &rank_t);
+	// printf("my rank_t = %d\n", rank_t);
+	// if (comm != MPI_COMM_NULL)
+	// 	MPI_Bcast(w, *n, MPI_DOUBLE, 0, comm);
+
+
+// #define DEBUG_PDSYEVD
+#ifdef DEBUG_PDSYEVD
+	int np, rank;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &np);
+	for (int k = 0; k < np; k++) {
+		MPI_Barrier(MPI_COMM_WORLD);
+		if (k == rank) {
+			printf("w = [\n");
+			for (int i = 0; i < *n; i++) {
+				printf("%20.16f\n",w[i]);
+			}
+			printf("]\n");
+		}
+	}
+#endif // DEBUG
 
 	free(work);
 	free(iwork);
@@ -108,10 +131,56 @@ void automem_pdsyevd_ (
 
 
 /**
+ * @brief Call the pdsyevd_ routine with an automatic workspace setup.
+ *
+ *        The original pdsyevd_ routine asks uses to provide the size of the 
+ *        workspace. This routine calls a workspace query and automatically sets
+ *        up the memory for the workspace, and then call the pdsyevd_ routine to
+ *        do the calculation.
+ */
+void automem_pdsyev_ ( 
+	char *jobz, char *uplo, int *n, double *a, int *ia, int *ja, int *desca, 
+	double *w, double *z, int *iz, int *jz, int *descz, int *info)
+{
+	int ictxt = desca[1], nprow, npcol, myrow, mycol;
+	Cblacs_gridinfo(ictxt, &nprow, &npcol, &myrow, &mycol);
+
+	int ZERO = 0, lwork, *iwork, liwork, *icluster;
+	double *work;
+	lwork = liwork = -1;
+	work  = (double *)malloc(100 * sizeof(double));
+	iwork = (int *)malloc(100 * sizeof(int)); 
+
+	//** first do a workspace query **//
+	pdsyev_(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, descz, 
+		work, &lwork, info);
+
+	int NNP, NN, NP0, MQ0, NB, N = *n;
+	lwork = (int) fabs(work[0]);
+	NB = desca[4]; // distribution block size
+	NN = max(max(N, NB),2);
+	NP0 = numroc_( &NN, &NB, &ZERO, &ZERO, &nprow );
+	MQ0 = numroc_( &NN, &NB, &ZERO, &ZERO, &npcol );
+	NNP = max(max(N,4), nprow * npcol+1);
+
+	lwork = max(lwork, 5 * N + max(5 * NN, NP0 * MQ0 + 2 * NB * NB) 
+				+ ((N - 1) / (nprow * npcol) + 1) * NN);
+	//lwork += max(N*N, min(10*lwork,2000000)); // for safety
+	work = realloc(work, lwork * sizeof(double));
+
+	// call the routine again to perform the calculation
+	pdsyev_(jobz, uplo, n, a, ia, ja, desca, w, z, iz, jz, descz, 
+		work, &lwork, info);
+
+	free(work);
+}
+
+
+/**
  * @brief A parallel dsygvd routine with an automatic workspace setup.
  *
  *        The only parallel generalized eigensolver in ScaLAPACK is pdsygvx_ 
- *        which uses the standard eigen-problem routine pdsyev. This routine 
+ *        which uses the standard eigen-problem routine pdsyevx. This routine 
  *        calls a workspace query and automatically sets up the memory for 
  *        the workspace.
  */
@@ -141,7 +210,7 @@ void automem_pdsygvd_(
 	lwork = (int) fabs(work[0]);
 	lwork += max(NB * (NP0+1), 3 * NB);
 	lwork += 2 * NP0 * NB + MQ0 * NB + NB * NB;
-	lwork += 10 * N + N * N; // for safety
+	// lwork += 10 * N + N * N; // for safety
 	work = realloc(work, lwork * sizeof(double));
 	pdsyngst_(ibtype, uplo, n, a, ia, ja, desca, b, ib, jb, 
 		descb, &scale, work, &lwork, info); // perform calculation
@@ -149,8 +218,26 @@ void automem_pdsygvd_(
 	// solve standard eigenproblem using D&C algorithm
 	automem_pdsyevd_(jobz, uplo, n, a, ia, ja, desca, 
 		w, z, iz, jz, descz, info);
+	
 	// automem_pdsyev_(jobz, uplo, n, a, ia, ja, desca, 
 	//     w, z, iz, jz, descz, info);
+
+
+#ifdef DEBUG_PDSYGVD
+	int np, rank;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &np);
+	for (int k = 0; k < np; k++) {
+		MPI_Barrier(MPI_COMM_WORLD);
+		if (k == rank) {
+			printf("w = [\n");
+			for (int i = 0; i < *n; i++) {
+				printf("%20.16f\n",w[i]);
+			}
+			printf("]\n");
+		}
+	}
+#endif // DEBUG
 
 	// back transform eigenvectors to the original problem
 	int wantz = lsame(jobz, "V", 1, 1);
@@ -188,3 +275,87 @@ void automem_pdsygvd_(
 	free(work);
 }
 
+
+
+
+/**
+ * @brief A parallel dsygvd routine with an automatic workspace setup.
+ *
+ *        The only parallel generalized eigensolver in ScaLAPACK is pdsygvx_ 
+ *        which uses the standard eigen-problem routine pdsyevx. This routine
+ *        instead uses the non "expert" standard solver pdsyev. This routine
+ *        calls a workspace query and automatically sets up the memory for 
+ *        the workspace.
+ */
+void automem_pdsygv_( 
+	int *ibtype, char *jobz, char *uplo, int *n, double *a, int *ia,
+	int *ja, int *desca, double *b, int *ib, int *jb, int *descb, 
+	double *w, double *z, int *iz, int *jz, int *descz, int *info)
+{
+	int ictxt = desca[1], nprow, npcol, myrow, mycol;
+	Cblacs_gridinfo(ictxt, &nprow, &npcol, &myrow, &mycol);
+	int ZERO = 0, NN, NP0, MQ0, NB, N = *n;
+	NB = desca[4]; // distribution block size
+	NN = max(max(N, NB),2);
+	NP0 = numroc_( &NN, &NB, &ZERO, &ZERO, &nprow );
+	MQ0 = numroc_( &NN, &NB, &ZERO, &ZERO, &npcol );
+
+	// Cholesky factorization of b = L*L' (uplo = 'L') = R'*R (uplo = 'U')
+	pdpotrf_(uplo, n, b, ib, jb, descb, info);
+	assert(*info == 0);
+
+	// Transform problem to standard eigenvalue problem
+	double scale = 1.0; // need to scale the final eigenvalue by scale
+	int lwork = -1;
+	double *work = (double *)malloc(100 * sizeof(double));
+	pdsyngst_(ibtype, uplo, n, a, ia, ja, desca, b, ib, jb, 
+		descb, &scale, work, &lwork, info); // query workspace
+	lwork = (int) fabs(work[0]);
+	lwork += max(NB * (NP0+1), 3 * NB);
+	lwork += 2 * NP0 * NB + MQ0 * NB + NB * NB;
+	// lwork += 10 * N + N * N; // for safety
+	work = realloc(work, lwork * sizeof(double));
+	pdsyngst_(ibtype, uplo, n, a, ia, ja, desca, b, ib, jb, 
+		descb, &scale, work, &lwork, info); // perform calculation
+
+	// solve standard eigenproblem using QR algorithm
+	// automem_pdsyevd_(jobz, uplo, n, a, ia, ja, desca, 
+	// 	w, z, iz, jz, descz, info);
+	automem_pdsyev_(jobz, uplo, n, a, ia, ja, desca, 
+	    w, z, iz, jz, descz, info);
+
+	// back transform eigenvectors to the original problem
+	int wantz = lsame(jobz, "V", 1, 1);
+	int upper = lsame(uplo, "U", 1, 1);
+
+	//printf("wantz = %d\n", wantz);
+	//printf("upper = %d\n", upper);
+	if (wantz) {
+		int neig = *n;
+		double alpha = 1.0;
+		if (*ibtype == 1 || *ibtype == 2) {
+			// For sub( A )*x=(lambda)*sub( B )*x and
+			//     sub( A )*sub( B )*x=(lambda)*x; 
+			// backtransform eigenvectors:
+			//     x = inv(L)'*y or inv(U)*y
+			//printf("using pdtrsm_ for backtransforming eigenvectors\n");
+			char trans = upper ? 'N' : 'T';
+			// pdtrsm_("L", uplo, &trans, "N", n, &neig, &alpha,
+			//     b, ib, jb, descb, z, iz, jz, descz);
+			pdtrsm_("L", uplo, "N", "N", n, &neig, &alpha,
+				b, ib, jb, descb, z, iz, jz, descz);
+		} else if (*ibtype == 3) {
+			// For sub( B )*sub( A )*x=(lambda)*x;
+			// backtransform eigenvectors: x = L*y or U'*y
+			//printf("using pdtrmm_ for backtransforming eigenvectors\n");
+			char trans = upper ? 'T' : 'N';
+			pdtrmm_("L", uplo, &trans, "N", n, &neig, &alpha,
+				b, ib, jb, descb, z, iz, jz, descz);
+		}
+	}
+
+	if ( fabs(scale-1.0) > 1e-14 )
+		cblas_dscal(*n, scale, w, 1);
+
+	free(work);
+}
